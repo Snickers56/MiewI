@@ -1,0 +1,98 @@
+import os
+import numpy as np
+import pandas as pd
+import librosa
+import parselmouth
+import tensorflow as tf
+
+
+def get_hnr(y, sr):
+    sound = parselmouth.Sound(y, sampling_frequency=sr)
+    hnr = sound.to_harmonicity(time_step=0.4)
+    return np.array(hnr)
+
+
+def extract_features(y, sr):
+    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, hop_length=hop_length, n_fft=1024)
+    S = librosa.power_to_db(S)
+    hnr_segment = get_hnr(y, sr)
+
+    _, cols = S.shape
+    hnr_segment_resized = np.resize(hnr_segment, (cols,))
+
+    return S, hnr_segment_resized
+
+
+# Charger le modèle
+model_path = os.path.join("C:\\Users\\simon\\Desktop\\", "vocalization_modelkeras53_modified")
+model = tf.keras.models.load_model(model_path)
+
+# Paramètres
+directory = "C:\\Users\\simon\\Desktop\\Tri"
+hop_length = None  # sera défini plus tard
+threshold = 0.85
+hnr_lower_threshold = 5
+hnr_upper_threshold = 600
+
+for filename in os.listdir(directory):
+    if filename.endswith(".wav"):
+        filepath = os.path.join(directory, filename)
+
+        y, sr = librosa.load(filepath, sr=None)
+        hop_length = int(0.4 * sr)
+
+        begin_times = []
+        end_times = []
+
+        in_vocalization = False
+        start_time = None
+
+        for i in range(0, len(y) - hop_length, hop_length):
+            start_sample = i
+            end_sample = i + hop_length
+            y_frame = y[start_sample:end_sample]
+
+            _, hnr = extract_features(y_frame, sr)
+
+            if hnr_lower_threshold <= hnr[0] <= hnr_upper_threshold:
+                S = extract_features(y_frame, sr)[0]
+                S = S[:, :, np.newaxis]
+                prediction = model.predict({"mel_input": np.array([S]), "hnr_input": np.array([hnr[0]])})
+                is_vocalization = (prediction[0][1] > threshold)
+            else:
+                is_vocalization = False
+
+            if is_vocalization and not in_vocalization:
+                in_vocalization = True
+                start_time = librosa.samples_to_time(start_sample, sr=sr)
+            elif not is_vocalization and in_vocalization:
+                in_vocalization = False
+                end_time = librosa.samples_to_time(end_sample, sr=sr)
+                begin_times.append(start_time)
+                end_times.append(end_time)
+
+        if in_vocalization:
+            end_time = librosa.samples_to_time(len(y), sr=sr)
+            begin_times.append(start_time)
+            end_times.append(end_time)
+
+        indices_to_remove = [i for i, (begin, end) in enumerate(zip(begin_times, end_times)) if end - begin <= 0.4]
+
+        for index in reversed(indices_to_remove):
+            del begin_times[index]
+            del end_times[index]
+
+        base_name = os.path.splitext(filename)[0]
+        begin_csv_name = f"Begin_{base_name}.csv"
+        end_csv_name = f"End_{base_name}.csv"
+
+        begin_csv_path = os.path.join(directory, begin_csv_name)
+        end_csv_path = os.path.join(directory, end_csv_name)
+
+        begin_df = pd.DataFrame(begin_times, columns=['Begin'])
+        begin_df.to_csv(begin_csv_path, index=False)
+
+        end_df = pd.DataFrame(end_times, columns=['End'])
+        end_df.to_csv(end_csv_path, index=False)
+
+        print(f"Vocalisations pour {filename} sauvegardées dans {begin_csv_path} et {end_csv_path}.")

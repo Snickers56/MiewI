@@ -1,0 +1,111 @@
+import os
+import librosa
+import numpy as np
+import pandas as pd
+import parselmouth
+import tensorflow as tf
+from sklearn.model_selection import train_test_split
+
+
+# Functions for feature extraction
+def get_hnr(y, sr):
+    sound = parselmouth.Sound(y, sampling_frequency=sr)
+    hnr = sound.to_harmonicity(time_step=0.4)
+    return np.array(hnr)
+
+
+def extract_features(y, sr, target_width=None):
+    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128, hop_length=hop_length, n_fft=1024)
+    S = librosa.power_to_db(S)
+    hnr_segment = get_hnr(y, sr)
+
+    # Zero-padding
+    if target_width:
+        current_width = S.shape[1]
+        if current_width < target_width:
+            pad_amount = target_width - current_width
+            S = np.pad(S, ((0, 0), (0, pad_amount)), mode='constant')
+            hnr_segment_resized = np.pad(hnr_segment, (0, pad_amount), mode='constant')
+        else:
+            S = S[:, :target_width]
+            hnr_segment_resized = hnr_segment[:target_width]
+    else:
+        _, cols = S.shape
+        hnr_segment_resized = np.resize(hnr_segment, (cols,))
+
+    return S, hnr_segment_resized
+
+
+df_voc = pd.read_excel("C:\\Users\\simon\\Desktop\\4159 T-1 All voc.xlsx")
+y, sr = librosa.load("C:\\Users\\simon\\Desktop\\GRD 4159 merges\\GRD 4159 240623 T-1.wav", sr=None)
+hop_length = int(0.4 * sr)
+
+features = []
+labels = []
+
+vocalization_intervals = [(librosa.time_to_samples(row['start'], sr=sr), librosa.time_to_samples(row['end'], sr=sr)) for _, row in df_voc.iterrows()]
+
+for i in range(0, len(y) - hop_length, hop_length):
+    start_sample = i
+    end_sample = i + hop_length
+    y_frame = y[start_sample:end_sample]
+    is_vocalization = any([start <= start_sample < end or start < end_sample <= end for start, end in vocalization_intervals])
+    S, hnr = extract_features(y_frame, sr)
+    features.append((S, hnr))
+    if is_vocalization:
+        labels.append('voc')
+    else:
+        labels.append('non-voc')
+
+X = features
+y = [1 if label == 'voc' else 0 for label in labels]
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+S_train = []
+hnr_train = []
+for feature in X_train:
+    S_train.append(feature[0][:, :, np.newaxis])
+    hnr_train.append(feature[1][0])  # Take the first value of hnr for each frame
+
+S_test = []
+hnr_test = []
+for feature in X_test:
+    S_test.append(feature[0][:, :, np.newaxis])
+    hnr_test.append(feature[1][0])  # Take the first value of hnr for each frame
+
+print(f"S_train shape: {np.array(S_train).shape}")
+print(f"hnr_train shape: {np.array(hnr_train).shape}")
+
+input_mel = tf.keras.layers.Input(shape=(128, 2, 1), name="mel_input")
+input_hnr = tf.keras.layers.Input(shape=(1,), name="hnr_input")
+
+x = tf.keras.layers.Conv2D(32, (2, 2), activation='relu', padding='same')(input_mel)
+x = tf.keras.layers.MaxPooling2D((2, 1))(x)
+x = tf.keras.layers.Conv2D(64, (2, 2), activation='relu', padding='same')(x)
+x = tf.keras.layers.MaxPooling2D((2, 1))(x)
+x = tf.keras.layers.Conv2D(128, (2, 2), activation='relu', padding='same')(x)
+x = tf.keras.layers.MaxPooling2D((2, 1))(x)
+
+pooled_x = tf.keras.layers.GlobalAveragePooling2D()(x)
+
+hnr_dense = tf.keras.layers.Dense(64, activation='relu')(input_hnr)
+hnr_dense = tf.keras.layers.Dense(128, activation='relu')(hnr_dense)
+
+concat = tf.keras.layers.concatenate([pooled_x, hnr_dense])
+out = tf.keras.layers.Dense(512, activation='relu')(concat)
+out = tf.keras.layers.Dense(2, activation='softmax')(out)
+
+model = tf.keras.Model(inputs=[input_mel, input_hnr], outputs=out)
+model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+train_data = {"mel_input": np.array(S_train), "hnr_input": np.array(hnr_train)}
+val_data = {"mel_input": np.array(S_test), "hnr_input": np.array(hnr_test)}
+
+try:
+    model.fit(train_data, np.array(y_train), epochs=10, batch_size=32, validation_data=(val_data, np.array(y_test)))
+except Exception as e:
+    print("Error encountered during training: ", e)
+
+model_path = os.path.join("C:\\Users\\simon\\Desktop\\", "vocalization_modelkeras53_modified")
+model.save(model_path)
